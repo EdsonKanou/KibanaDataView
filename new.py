@@ -1,96 +1,127 @@
+# kibana_dataviews_utils.py
+
+import json
 import requests
-import smtplib
-from email.message import EmailMessage
+import time
+import copy
+from kibana import request_kibana
 
-# ---------------------------
-# CONFIGURATION
-# ---------------------------
-KIBANA_URL = "http://your-kibana-server:5601"
-HEADERS = {
-    "kbn-xsrf": "true",
-    "Content-Type": "application/json",
-    "Authorization": "Bearer YOUR_TOKEN"  # ou Basic Auth si nécessaire
-}
 
-EMAIL_SENDER = "alert@example.com"
-EMAIL_RECEIVER = "admin@example.com"
-SMTP_SERVER = "smtp.example.com"
-SMTP_PORT = 587
-SMTP_USER = "alert@example.com"
-SMTP_PASSWORD = "your_password"
+def get_dvs_from_env(env, space_id):
+    """
+    Récupère tous les dataviews (index-pattern) d'un espace dans un environnement Kibana.
+    
+    :param env: Informations de connexion à l'environnement Kibana
+    :param space_id: ID de l'espace Kibana
+    :return: Liste de dataviews (dictionnaires)
+    :raises: Exception en cas d'échec
+    """
+    try:
+        response = request_kibana(
+            f"/s/{space_id}/api/saved_objects/_find?type=index-pattern&per_page=10000",
+            "GET",
+            env
+        )
 
-# ---------------------------
-# FONCTION : ENVOI MAIL
-# ---------------------------
-def send_alert_email(dv_name):
-    msg = EmailMessage()
-    msg["Subject"] = f"[ALERTE] DV vide sans historique : {dv_name}"
-    msg["From"] = EMAIL_SENDER
-    msg["To"] = EMAIL_RECEIVER
-    msg.set_content(f"La data view '{dv_name}' est vide et ne possède pas de version historique dans le space_cold.")
+        if not 200 <= response.status_code <= 300:
+            raise Exception("Failed to get dataviews, error: Dataviews not found")
 
-    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASSWORD)
-        server.send_message(msg)
-    print(f"Email envoyé pour DV : {dv_name}")
+        dataviews = response.json().get("saved_objects", [])
 
-# ---------------------------
-# FONCTION : RÉCUPÉRER LES DATA VIEWS
-# ---------------------------
-def get_data_views():
-    url = f"{KIBANA_URL}/api/saved_objects/_find?type=index-pattern&per_page=10000"
-    response = requests.get(url, headers=HEADERS)
-    response.raise_for_status()
-    return response.json()["saved_objects"]
+        # Dump with keys sorted
+        dv_strings = [json.dumps(dv, sort_keys=True) for dv in dataviews]
 
-# ---------------------------
-# FONCTION : VÉRIFIER SI LA DV EST VIDE
-# ---------------------------
-def is_data_view_empty(dv):
-    fields = dv.get("attributes", {}).get("fields", "[]")
-    return fields == "[]"
+        # Supprimer les doublons
+        unique_dvs = set(dv_strings)
 
-# ---------------------------
-# FONCTION : VÉRIFIER SI LA VERSION HISTORIQUE EXISTE
-# ---------------------------
-def has_historical_version(dv_name):
-    hist_id = f"hist_{dv_name}"
-    url = f"{KIBANA_URL}/s/space_cold/api/saved_objects/index-pattern/{hist_id}"
-    response = requests.get(url, headers=HEADERS)
-    return response.status_code == 200
+        # Recharger en objets Python
+        all_dataviews = [json.loads(dv_string) for dv_string in unique_dvs]
 
-# ---------------------------
-# FONCTION : SUPPRIMER LA DV
-# ---------------------------
-def delete_data_view(dv_id):
-    url = f"{KIBANA_URL}/api/saved_objects/index-pattern/{dv_id}"
-    response = requests.delete(url, headers=HEADERS)
-    if response.status_code == 200:
-        print(f"Data view supprimée : {dv_id}")
-    else:
-        print(f"Échec de suppression pour : {dv_id} - {response.status_code}")
+        return all_dataviews
 
-# ---------------------------
-# MAIN LOGIC
-# ---------------------------
-def main():
-    dvs = get_data_views()
-    print(f"{len(dvs)} Data Views trouvées.")
+    except Exception as error:
+        raise Exception(f"Failed to get dataviews, error: {error}")
 
-    for dv in dvs:
-        dv_id = dv["id"]
-        dv_name = dv["attributes"].get("title", "")
 
-        if is_data_view_empty(dv):
-            print(f"DV vide détectée : {dv_name}")
+def get_empty_dataviews(dataviews):
+    """
+    Retourne les dataviews dont le champ 'fields' est vide ou inexistant.
+    """
+    return [
+        dv for dv in dataviews
+        if not dv.get("attributes", {}).get("fields")
+    ]
 
-            if has_historical_version(dv_name):
-                print(f"→ Version historique trouvée. Suppression de {dv_name}.")
-                delete_data_view(dv_id)
-            else:
-                print(f"→ Pas de version historique trouvée pour {dv_name}. Envoi d'une alerte.")
-                send_alert_email(dv_name)
 
+def get_non_empty_dataviews(dataviews):
+    """
+    Retourne les dataviews dont le champ 'fields' est renseigné.
+    """
+    return [
+        dv for dv in dataviews
+        if dv.get("attributes", {}).get("fields")
+    ]
+
+
+def print_empty_dataview_ids(dataviews):
+    """
+    Affiche les IDs des dataviews vides.
+    """
+    empty_dvs = get_empty_dataviews(dataviews)
+    for dv in empty_dvs:
+        print(dv.get("id"))
+
+
+def get_empty_dataview_ids(dataviews):
+    """
+    Retourne la liste des IDs des dataviews vides.
+    """
+    return [dv.get("id") for dv in get_empty_dataviews(dataviews)]
+
+
+def match_with_historical_version(empty_dvs, historical_dvs):
+    """
+    Pour chaque dataview vide, cherche un équivalent nommé 'hist_<nom>'
+    dans la liste des dataviews du space 'co'.
+
+    :param empty_dvs: dataviews vides dans un autre espace (ex: default)
+    :param historical_dvs: dataviews du space 'co'
+    :return: Liste de tuples (nom_dv_vide, id_dv_vide, hist_dv_id ou 'pas trouvé')
+    """
+    result = []
+    hist_titles = {
+        dv.get("attributes", {}).get("title"): dv.get("id")
+        for dv in historical_dvs
+    }
+
+    for dv in empty_dvs:
+        title = dv.get("attributes", {}).get("title", "")
+        expected_hist_name = f"hist_{title}"
+        hist_id = hist_titles.get(expected_hist_name, "pas trouvé")
+        result.append((title, dv.get("id"), hist_id))
+
+    return result
+
+
+# Exemple d'utilisation
 if __name__ == "__main__":
-    main()
+    # Exemple d'environnement, à adapter
+    env = {
+        "host": "https://kibana.example.com",
+        "auth_token": "your_auth_token"
+    }
+
+    # Récupération des dataviews
+    dv_default = get_dvs_from_env(env, "default")
+    dv_co = get_dvs_from_env(env, "co")
+
+    # Dataviews vides
+    empty_dvs = get_empty_dataviews(dv_default)
+
+    # Comparaison avec les versions historiques dans 'co'
+    match_results = match_with_historical_version(empty_dvs, dv_co)
+
+    # Affichage
+    print("\nCorrespondance des dataviews vides avec leur version historique :")
+    for name, id_empty, hist_id in match_results:
+        print(f"{name} (ID: {id_empty}) → Équivalent historique: {hist_id}")
