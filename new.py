@@ -79,6 +79,31 @@ def delete_dvs_without_historical(env, space_id, match_results):
                 print(f"Supprimé : {name} (ID: {dv_id})")
             else:
                 print(f"Échec de suppression : {name} (ID: {dv_id})")
+                
+                
+                
+def filter_itgsoc_dvs(dvs):
+    """
+    Filtre les Data Views dont l'ID commence par 'itgsoc'
+    
+    :param dvs: Liste des Data Views (issues de l'API Kibana)
+    :return: Liste filtrée de DV
+    """
+    return [dv for dv in dvs if dv["id"].startswith("itgsoc")]
+
+
+def extract_version_from_id(dv_id):
+    """
+    Extrait la version depuis un ID de Data View formaté comme val1-val2-version
+    
+    :param dv_id: ID de la Data View
+    :return: version (str)
+    """
+    parts = dv_id.split('-')
+    if len(parts) < 3:
+        return None  # Format inattendu
+    return parts[-1]  # Dernière partie = version
+
 
 
 def send_dataview_summary_email(sender_email, receiver_email, smtp_server, smtp_port, smtp_login, smtp_password, matched, space_id):
